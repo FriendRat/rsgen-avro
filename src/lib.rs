@@ -248,6 +248,9 @@ fn deps_stack(schema: &Schema) -> Vec<&Schema> {
             // No nested schemas, add them to the result stack
             Schema::Fixed { .. } => push_unique(&mut deps, s),
             Schema::Enum { .. } => push_unique(&mut deps, s),
+            Schema::Decimal { inner, .. } if matches!(**inner, Schema::Fixed{ .. }) => {
+                push_unique(&mut deps, s)
+            } // TODO: needed ?
 
             // Explore the record fields for potentially nested schemas
             Schema::Record { fields, .. } => {
@@ -692,8 +695,6 @@ impl Default for Snmp {
 
     #[test]
     fn deps() {
-        use matches::assert_matches;
-
         let raw_schema = r#"
 {
   "type": "record",
@@ -720,15 +721,15 @@ impl Default for Snmp {
         let mut deps = deps_stack(&schema);
 
         let s = deps.pop().unwrap();
-        assert_matches!(s, Schema::Enum{ name: Name { ref name, ..}, ..} if name == "Country");
+        assert!(matches!(s, Schema::Enum{ name: Name { ref name, ..}, ..} if name == "Country"));
 
         let s = deps.pop().unwrap();
-        assert_matches!(s, Schema::Record{ name: Name { ref name, ..}, ..} if name == "Address");
+        assert!(matches!(s, Schema::Record{ name: Name { ref name, ..}, ..} if name == "Address"));
 
         let s = deps.pop().unwrap();
-        assert_matches!(s, Schema::Record{ name: Name { ref name, ..}, ..} if name == "User");
+        assert!(matches!(s, Schema::Record{ name: Name { ref name, ..}, ..} if name == "User"));
 
         let s = deps.pop();
-        assert_matches!(s, None);
+        assert!(matches!(s, None));
     }
 }
