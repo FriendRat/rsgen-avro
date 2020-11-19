@@ -95,6 +95,7 @@
 //! ```
 
 pub mod error;
+mod compose;
 mod templates;
 
 use std::collections::{HashMap, VecDeque};
