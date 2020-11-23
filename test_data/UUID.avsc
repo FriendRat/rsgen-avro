@@ -1,0 +1,7 @@
+{
+	"name": "UUID",
+	"type": "record",
+	"fields": [
+		{"name": "bytes", "type": "bytes"}
+	]
+}
