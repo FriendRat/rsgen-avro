@@ -132,6 +132,56 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
 
 }
 
+fn compose(target_type: &String,
+           raw_schemas: &mut HashMap<String, Map<String, Value>>,
+           dependencies: &HashSet<String> ) {
+    // Copy the schema definitions necessary
+    let mut deps : HashMap<&String, Map<String, Value>> = HashMap::new();
+    for dep in dependencies {
+        deps.insert(dep,
+                    raw_schemas.get(dep)
+                        .expect("Failed to fetch dependency of target type")
+                        .to_owned());
+    }
+
+    let target_schema = raw_schemas.get_mut(target_type).unwrap();
+    // determine the type of the target schema
+    let avro_type = target_schema.get("type")
+        .expect("Found Avro schema json without a \"type\" field.")
+        .as_str()
+        .expect("Failed to parse \"type\" field of Avro schema json.");
+
+    match avro_type {
+        "array" => {
+            let dep_name = target_schema.get("items").unwrap().to_string();
+            target_schema.insert("items".to_string(),
+                                 Value::Object(deps.remove(&dep_name).unwrap()));
+        },
+        "map" => {
+            let dep_name = target_schema.get("values").unwrap().to_string();
+            target_schema.insert("values".to_string(),
+                                 Value::Object(deps.remove(&dep_name).unwrap()));
+        },
+        "record" => {
+            if let Value::Array(inner) = target_schema.get("fields").unwrap().to_owned() {
+                for (ix, field) in inner.iter().enumerate() {
+                    let dep_name = field.get("type")
+                        .unwrap()
+                        .to_string();
+                    if dependencies.contains(&dep_name) {
+                        *target_schema.get_mut("fields").unwrap()[ix].get_mut("type").unwrap() =
+                            Value::Object(deps.get(&dep_name).unwrap().to_owned());
+                    }
+                }
+            }
+
+        },
+        _ => {}
+    }
+
+
+}
+
 /// For each schema name, a set of types it depends on and types that depend on it are computed
 ///
 /// The dependencies of the the types defined by the schemas should for a directed acyclic graph
@@ -183,7 +233,7 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
 /// }
 /// ```
 #[allow(unused_must_use)]
-fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String ,Value>>) -> [HashMap<&String, HashSet<String>>; 2] {
+fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [HashMap<&String, HashSet<String>>; 2] {
 
     // Value is all types who need the key as part of their definition
     let mut ancestors: HashMap<&String, HashSet<String>> = HashMap::new();
@@ -203,6 +253,9 @@ fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String ,Value>>) -> [
     }
     [ancestors, descendants]
 }
+
+
+
 
 #[cfg(test)]
 mod compose_tests {
@@ -362,4 +415,112 @@ mod compose_tests {
         assert_eq!(descendants, expected_descendants);
     }
 
+    #[test]
+    fn test_compose_record() {
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+            .expect("Failed to read json schemas from directory.");
+        let dependencies = determine_dependencies(raw_schema_jsons.get("\"Other\"")
+            .expect("Test failed"));
+        compose(&"\"Other\"".to_string(), &mut raw_schema_jsons, &dependencies);
+
+        let schema = raw_schema_jsons.get("\"Other\"").expect("Test failed");
+        if let Value::Object(expected) = serde_json::from_str(r#"
+        {
+        	"name": "Other",
+        	"type": "record",
+        	"fields": [
+        		{"name": "id", "type": {"name": "UUID",
+                                        "type": "record",
+                                        "fields": [
+                                        	{"name": "bytes", "type": "bytes"}
+                                        ]}},
+        		{"name": "other", "type": {"name": "UUID",
+                                        "type": "record",
+                                        "fields": [
+                                        	{"name": "bytes", "type": "bytes"}
+                                        ]}}
+        	]
+        }
+        "#).expect("Test failed") {
+            assert_eq!(schema, &expected);
+        } else {
+            panic!("Test failed")
+        };
+    }
+
+    #[test]
+    fn test_array_compose() {
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+            .expect("Failed to read json schemas from directory.");
+
+        if let Value::Object(raw_schema) = serde_json::from_str(r#"
+        {
+            "name": "Array",
+            "type": "array",
+            "items": "UUID"
+        }
+        "#).expect("Test failed") {
+            let dependencies = determine_dependencies(&raw_schema);
+            raw_schema_jsons.insert("\"Array\"".to_string(),raw_schema);
+
+            compose(&"\"Array\"".to_string(), &mut raw_schema_jsons, &dependencies);
+            let schema = raw_schema_jsons.get("\"Array\"").expect("Test failed");
+            if let Value::Object(expected) = serde_json::from_str(r#"
+            {
+        	"name": "Array",
+        	"type": "array",
+        	"items": {"name": "UUID",
+                      "type": "record",
+                      "fields": [
+                      	{"name": "bytes", "type": "bytes"}
+                      ]}
+            }
+            "#).expect("Test failed") {
+                assert_eq!(schema, &expected);
+            } else {
+                panic!("Test failed")
+            };
+
+        } else {
+            panic!("Test failed");
+        }
+    }
+
+    #[test]
+    fn test_map_compose() {
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+            .expect("Failed to read json schemas from directory.");
+
+        if let Value::Object(raw_schema) = serde_json::from_str(r#"
+        {
+            "name": "Map",
+            "type": "map",
+            "values": "UUID"
+        }
+        "#).expect("Test failed") {
+            let dependencies = determine_dependencies(&raw_schema);
+            raw_schema_jsons.insert("\"Map\"".to_string(),raw_schema);
+
+            compose(&"\"Map\"".to_string(), &mut raw_schema_jsons, &dependencies);
+            let schema = raw_schema_jsons.get("\"Map\"").expect("Test failed");
+            if let Value::Object(expected) = serde_json::from_str(r#"
+            {
+        	"name": "Map",
+        	"type": "map",
+        	"values": {"name": "UUID",
+                      "type": "record",
+                      "fields": [
+                      	{"name": "bytes", "type": "bytes"}
+                      ]}
+            }
+            "#).expect("Test failed") {
+                assert_eq!(schema, &expected);
+            } else {
+                panic!("Test failed")
+            };
+
+        } else {
+            panic!("Test failed");
+        }
+    }
 }
