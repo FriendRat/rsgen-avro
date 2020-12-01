@@ -135,7 +135,6 @@ fn is_primitive(ty: &Value) -> bool {
 ///
 /// All other input types produce an empty vector of dependencies.
 fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
-    // TODO: Replace vec with set, currently repeated dependencies can appear in output
     let mut dependencies: HashSet<String> = HashSet::new();
     match raw_schema.get("type")
         .expect("Found Avro schema json without a \"type\" field.")
@@ -342,7 +341,6 @@ fn compose(target_type: &String,
                     }
                 }
             }
-
         },
         _ => {}
     }
@@ -434,7 +432,6 @@ pub fn resolve_cross_dependencies(schemas_dir: &Path)
     } else {
         Ok(raw_schema_jsons)
     }
-
 }
 
 /// Determines the reason the resolution of dependencies fails. Can be either from cycle of
