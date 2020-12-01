@@ -1,8 +1,0 @@
-{
-	"name": "Other",
-	"type": "record",
-	"fields": [
-		{"name": "id", "type": "UUID"},
-		{"name": "other", "type": "UUID"}
-	]
-}

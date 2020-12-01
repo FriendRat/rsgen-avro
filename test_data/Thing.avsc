@@ -1,8 +1,0 @@
-{
-	"name": "Thing",
-	"type": "record",
-	"fields": [
-		{"name": "id", "type": "UUID"},
-		{"name": "other", "type": "float"}
-	]
-}

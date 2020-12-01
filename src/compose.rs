@@ -14,6 +14,12 @@ pub struct DependencyResolutionError {
     msg: String
 }
 
+#[derive(Eq, PartialEq, Debug)]
+enum ResolutionErrorCause {
+    Cyclic,
+    Missing(String)
+}
+
 impl DependencyResolutionError {
 
     /// Makes the appropriate error message for when the definition for a dependency is not found
@@ -31,7 +37,7 @@ impl DependencyResolutionError {
         DependencyResolutionError{
             failed_type: failed_type.to_string(),
             failed_dependency: None,
-            msg: format!("The type definition <{}> appears to be part of a cycle of  dependencies;\
+            msg: format!("The type definition <{}> appears to be part of a cycle of dependencies; \
              this is not currently supported.",  failed_type)
         }
     }
@@ -239,7 +245,11 @@ fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [
         dependencies.iter().map(|dep| {
             match ancestors.get_mut(dep){
                 Some(ancs) => ancs.insert(name.to_owned()),
-                None => ancestors.insert(dep.to_owned(), [name.to_owned()].iter().cloned().collect()).is_some()
+                None => ancestors.insert(dep.to_owned(), [name.to_owned()]
+                    .iter()
+                    .cloned()
+                    .collect())
+                    .is_some()
             };
         }).collect::<()>();
     }
@@ -349,12 +359,14 @@ fn compose(target_type: &String,
 /// the new set of leaves.
 ///
 /// At each stage, it is checked if any new leaves are created. If none are, the loop is terminated.
-/// If not every type is resolved, it implies that a cycle of dependencies exists and an error is
-/// raised. Similarly, if a type definition is required, but not found, this error is propagated
-/// from the compose function (which is where such an error will be detected).
+/// If not every type is resolved, it implies that a cycle of dependencies exists or that a type
+/// definition is required, but not found. If so, an error is raised saying the type the failed and
+/// whether is a) is part of a cycle of dependencies or b) needs a type definition that is missing
+/// and the name of the missing type
 ///
 /// However, if every type is resolved, the resulting json schemas will be returned as a HashMap.
-pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<HashMap<String, Map<String, Value>>, DependencyResolutionError> {
+pub fn resolve_cross_dependencies(schemas_dir: &Path)
+    -> Result<HashMap<String, Map<String, Value>>, DependencyResolutionError> {
     let mut raw_schema_jsons = raw_schema_jsons(schemas_dir)
         .expect("Failed to read schemas from given directory");
 
@@ -397,31 +409,90 @@ pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<HashMap<String, 
                 next_iteration_of_resolution.push_back(to_resolve);
             }
         }
+        to_be_resolved.append(&mut next_iteration_of_resolution);
         if !any_resolved {
             break;
-        } else {
-            to_be_resolved.append(&mut next_iteration_of_resolution);
         }
     }
 
-
-    if to_be_resolved.len() > 0 {
-        Err(DependencyResolutionError::cyclic_dependency(to_be_resolved.pop_front().unwrap()))
+    if let Some(first) = to_be_resolved.pop_front() {
+        match resolution_failure_reason(&raw_schema_jsons, [&ancestors, &descendants]) {
+            ResolutionErrorCause::Missing(type_name) => {
+                Err(DependencyResolutionError::missing_dependency(
+                    ancestors.get(&type_name)
+                        .unwrap()
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .as_str(),
+                    type_name.as_str()))
+            },
+            ResolutionErrorCause::Cyclic => {
+                Err(DependencyResolutionError::cyclic_dependency(first))
+            }
+        }
     } else {
         Ok(raw_schema_jsons)
     }
 
 }
 
+/// Determines the reason the resolution of dependencies fails. Can be either from cycle of
+/// dependencies or because a type definition was missing.
+///
+/// All required type definitions are checked and if any are missing, this is returned as the reason
+/// along with the name of the missing type. Otherwise, the reason given is the presence of a cycle
+/// of dependencies. It is the job of the calling function to determine a type in this cycle and
+/// communicate its name in the error message.
+fn resolution_failure_reason(raw_schema_jsons: &HashMap<String, Map<String, Value>>,
+                             graph: [&HashMap<String, HashSet<String>>; 2]) -> ResolutionErrorCause {
+    let defined_types: HashSet<&String> = raw_schema_jsons.keys().collect();
+
+    for direction in &graph {
+        for neighbors in direction.values() {
+            let nghbrs: HashSet<&String> = neighbors.iter().collect();
+            if let Some(missing) = nghbrs.difference(&defined_types).next() {
+                return ResolutionErrorCause::Missing((*missing).to_owned());
+            }
+        }
+    }
+    ResolutionErrorCause::Cyclic
+}
 
 
 #[cfg(test)]
 mod compose_tests {
     use super::*;
+    use std::io::Write;
+
+    fn setup(path: &Path) -> Result<(), Box<dyn Error>> {
+        std::fs::create_dir(path)?;
+        let mut file_uuid = File::create(path.join("UUID.avsc"))?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_thing = File::create(path.join("Thing.avsc"))?;
+        file_thing.write_all(br#"{
+	"name": "Thing",
+	"type": "record",
+	"fields": [{"name": "id", "type": "UUID"},{"name": "other", "type": "float"}]}"#)?;
+        let mut file_other = File::create(path.join("Other.avsc"))?;
+        file_other.write_all(br#"{
+	"name": "Other",
+	"type": "record",
+	"fields": [
+		{"name": "id", "type": "UUID"},
+		{"name": "other", "type": "UUID"}]}"#)?;
+        Ok(())
+    }
+
+    fn teardown(path : &Path) -> Result<(), Box<dyn Error>> {
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
 
     #[test]
-    fn test_raw_jsons() {
-        let raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_raw_jsons()-> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_raw_jsons"))?;
+        let raw_schema_jsons = raw_schema_jsons(Path::new("test_raw_jsons"))
             .expect("Failed to read json schemas from directory.");
 
         if let Value::Object(expected_uuid) = serde_json::from_str(&r#"
@@ -469,6 +540,7 @@ mod compose_tests {
         }
 
         assert_eq!(raw_schema_jsons.len(), 3);
+        teardown(Path::new("test_raw_jsons"))
     }
 
     #[test]
@@ -568,8 +640,9 @@ mod compose_tests {
     }
 
     #[test]
-    fn test_dependency_graph() {
-        let raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_dependency_graph() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_dependency_graph"))?;
+        let raw_schema_jsons = raw_schema_jsons(Path::new("test_dependency_graph"))
             .expect("Failed to read json schemas from directory.");
         let [ancestors, descendants] = build_dependency_tree(&raw_schema_jsons);
         let expected_ancestors: HashMap<String, HashSet<String>> = [("\"UUID\"".to_string(),
@@ -589,11 +662,13 @@ mod compose_tests {
             .cloned()
             .collect();
         assert_eq!(descendants, expected_descendants);
+        teardown(Path::new("test_dependency_graph"))
     }
 
     #[test]
-    fn test_compose_record() {
-        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_compose_record() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_compose_record"))?;
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_compose_record"))
             .expect("Failed to read json schemas from directory.");
         let dependencies = determine_dependencies(raw_schema_jsons.get("\"Other\"")
             .expect("Test failed"));
@@ -623,11 +698,13 @@ mod compose_tests {
         } else {
             panic!("Test failed")
         };
+        teardown(Path::new("test_compose_record"))
     }
 
     #[test]
-    fn test_array_compose() {
-        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_array_compose() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_array_compose"))?;
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_array_compose"))
             .expect("Failed to read json schemas from directory.");
 
         if let Value::Object(raw_schema) = serde_json::from_str(r#"
@@ -663,11 +740,13 @@ mod compose_tests {
         } else {
             panic!("Test failed");
         }
+        teardown(Path::new("test_array_compose"))
     }
 
     #[test]
-    fn test_map_compose() {
-        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_map_compose() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_map_compose"))?;
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_map_compose"))
             .expect("Failed to read json schemas from directory.");
 
         if let Value::Object(raw_schema) = serde_json::from_str(r#"
@@ -703,11 +782,13 @@ mod compose_tests {
         } else {
             panic!("Test failed");
         }
+        teardown(Path::new("test_map_compose"))
     }
 
     #[test]
-    fn test_compose_err() {
-        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_data"))
+    fn test_compose_err() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_compose_err"))?;
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_compose_err"))
             .expect("Failed to read json schemas from directory.");
 
         if let Value::Object(raw_schema) = serde_json::from_str(r#"
@@ -731,14 +812,161 @@ mod compose_tests {
         } else {
             panic!("Test failed.")
         }
+        teardown(Path::new("test_compose_err"))
     }
 
     #[test]
     fn test_resolve_cross_dependencies() -> Result<(), Box<dyn Error>> {
-        let raw_schema_jsons = resolve_cross_dependencies(Path::new("test_data"))?;
-        for schema in raw_schema_jsons.values() {
-            println!("{:?}", schema);
+        setup(Path::new("test_resolve_cross_dependencies"))?;
+        let raw_schema_jsons = resolve_cross_dependencies(Path::new("test_resolve_cross_dependencies"))?;
+        if let Value::Object(thing_expected) = serde_json::from_str(r#"
+            {
+              "name": "Thing",
+              "type": "record",
+              "fields": [
+                {
+                  "name": "id",
+                  "type": {
+                  	"name": "UUID",
+                    "type": "record",
+                    "fields": [{"name": "bytes", "type": "bytes"}]
+                  }
+                },
+                {"name": "other","type": "float"}
+              ]
+            }
+        "#).expect("Test failed"){
+            assert_eq!(&thing_expected, raw_schema_jsons.get("\"Thing\"").unwrap());
+        } else {
+            panic!("Test failed");
         }
-        Ok(())
+
+        if let Value::Object(other_expected) = serde_json::from_str(r#"
+        {
+          "name": "Other",
+          "type": "record",
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+              	"name": "UUID",
+                "type": "record",
+                "fields": [{"name": "bytes","type": "bytes"}]
+              }
+            },
+            {
+              "name": "other",
+              "type": {
+              	"name": "UUID",
+                "type": "record",
+                "fields": [{"name": "bytes", "type": "bytes"}]
+              }
+            }
+          ]
+        }
+        "#).expect("Test failed") {
+            assert_eq!(&other_expected, raw_schema_jsons.get("\"Other\"").unwrap());
+        }
+
+        if let Value::Object(uuid_expected) = serde_json::from_str(r#"
+        {
+            "name": "UUID",
+            "type": "record",
+            "fields": [
+            {"name": "bytes", "type": "bytes"}
+            ]
+        }
+        "#).expect("Test failed") {
+            assert_eq!(&uuid_expected, raw_schema_jsons.get("\"UUID\"").unwrap());
+        }
+        assert_eq!(raw_schema_jsons.len(), 3);
+        teardown(Path::new("test_resolve_cross_dependencies"))
+    }
+
+    #[test]
+    fn test_missing_dependency() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_missing_dependency"))?;
+        let mut incomplete = File::create(Path::new("test_missing_dependency/incomplete.avsc"))?;
+        incomplete.write_all(br#"{"name": "incomplete",
+         "type": "record",
+         "fields": [{"name": "thing", "type": "Thing"}, {"name": "unknown", "type": "Unknown"}]
+         }
+         "#)?;
+
+        let err = resolve_cross_dependencies(Path::new("test_missing_dependency"))
+            .expect_err("Test failed");
+
+        assert_eq!(err.failed_type, "\"incomplete\"");
+        assert_eq!(err.failed_dependency, Some("\"Unknown\"".to_string()));
+        teardown(Path::new("test_missing_dependency"))
+    }
+
+    #[test]
+    fn test_missing_dependency_reason() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_missing_dependency_reason"))?;
+        let mut incomplete = File::create(Path::new("test_missing_dependency_reason/incomplete.avsc"))?;
+        incomplete.write_all(br#"{"name": "incomplete",
+         "type": "record",
+         "fields": [{"name": "thing", "type": "Thing"}, {"name": "unknown", "type": "Unknown"}]
+         }
+         "#)?;
+
+        let raw_schema_jsons = raw_schema_jsons(Path::new("test_missing_dependency_reason"))
+            .expect("Test failed");
+        let graph = build_dependency_tree(&raw_schema_jsons);
+        assert_eq!(resolution_failure_reason(&raw_schema_jsons, [&graph[0], &graph[1]]),
+                   ResolutionErrorCause::Missing("\"Unknown\"".to_string()));
+        teardown(Path::new("test_missing_dependency_reason"))
+    }
+
+    #[test]
+    fn test_cyclic_dependency() -> Result<(), Box<dyn Error>> {
+        let path = Path::new("test_cyclic_dependency");
+        std::fs::create_dir(path)?;
+        let mut file_uuid = File::create(path.join("UUID.avsc"))?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_thing = File::create(path.join("Thing.avsc"))?;
+        file_thing.write_all(br#"{
+	"name": "Thing",
+	"type": "record",
+	"fields": [{"name": "id", "type": "UUID"},{"name": "other", "type": "Other"}]}"#)?;
+        let mut file_other = File::create(path.join("Other.avsc"))?;
+        file_other.write_all(br#"{
+	"name": "Other",
+	"type": "record",
+	"fields": [
+		{"name": "thing", "type": "Thing"}]}"#)?;
+
+        let err = resolve_cross_dependencies(path).expect_err("Test failed");
+        assert_eq!(err.failed_type, "\"Thing\"");
+        assert_eq!(err.failed_dependency, None);
+        teardown(path)
+
+    }
+
+    #[test]
+    fn test_cyclic_dependency_reason() -> Result<(), Box<dyn Error>>{
+        let path = Path::new("test_cyclic_dependency_reason");
+        std::fs::create_dir(path)?;
+        let mut file_uuid = File::create(path.join("UUID.avsc"))?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_thing = File::create(path.join("Thing.avsc"))?;
+        file_thing.write_all(br#"{
+	"name": "Thing",
+	"type": "record",
+	"fields": [{"name": "id", "type": "UUID"},{"name": "other", "type": "Other"}]}"#)?;
+        let mut file_other = File::create(path.join("Other.avsc"))?;
+        file_other.write_all(br#"{
+	"name": "Other",
+	"type": "record",
+	"fields": [
+		{"name": "id", "type": "UUID"},
+		{"name": "thing", "type": "Thing"}]}"#)?;
+
+        let raw_json_schemas = raw_schema_jsons(path).expect("Test failed");
+        let graph = build_dependency_tree(&raw_json_schemas);
+        assert_eq!(resolution_failure_reason(&raw_json_schemas, [&graph[0], &graph[1]]),
+        ResolutionErrorCause::Cyclic);
+        teardown(path)
     }
 }
