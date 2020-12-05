@@ -1,4 +1,5 @@
 use thiserror::Error;
+use crate::compose::DependencyResolutionError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -18,6 +19,10 @@ impl From<failure::Error> for Error {
     fn from(source: failure::Error) -> Self {
         Error::Failure(source.to_string())
     }
+}
+
+impl From<DependencyResolutionError> for Error {
+    fn from(source: DependencyResolutionError) -> Self{ Error::Schema(source.msg)}
 }
 
 impl From<tera::Error> for Error {

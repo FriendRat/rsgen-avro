@@ -4,14 +4,15 @@ use serde_json::{self, Value, Map};
 use std::fs::File;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::{fmt, error::Error};
+use thiserror::Error;
 
 
 /// Custom errors.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub struct DependencyResolutionError {
     failed_type: String,
     failed_dependency: Option<String>,
-    msg: String
+    pub(crate) msg: String
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -19,6 +20,9 @@ enum ResolutionErrorCause {
     Cyclic,
     Missing(String)
 }
+
+type SchemaMap = HashMap<String, Map<String, Value>>;
+pub type SchemaGraph = HashMap<String, HashSet<String>>;
 
 impl DependencyResolutionError {
 
@@ -33,16 +37,15 @@ impl DependencyResolutionError {
     }
 
     /// Makes the appropriate error message for when a cycle of dependencies is found
-    pub fn cyclic_dependency(failed_type: &str) -> DependencyResolutionError {
+    pub fn cyclic_dependency(failed_type: String) -> DependencyResolutionError {
         DependencyResolutionError{
-            failed_type: failed_type.to_string(),
+            failed_type: failed_type.clone(),
             failed_dependency: None,
             msg: format!("The type definition <{}> appears to be part of a cycle of dependencies; \
-             this is not currently supported.",  failed_type)
+             this is not currently supported.",  &failed_type)
         }
     }
 }
-impl Error for DependencyResolutionError { }
 
 impl fmt::Display for DependencyResolutionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -50,9 +53,10 @@ impl fmt::Display for DependencyResolutionError {
     }
 }
 
+
 /// Makes a hashmap indexing the Avro schema jsons by schema name
-fn raw_schema_jsons(schemas_dir: &Path) -> io::Result<HashMap<String, Map<String, Value>>> {
-    let mut raw_schema_jsons: HashMap<String, Map<String, Value>> = HashMap::new();
+fn raw_schema_jsons(schemas_dir: &Path) -> io::Result<SchemaMap> {
+    let mut raw_schema_jsons: SchemaMap = HashMap::new();
     for entry in std::fs::read_dir(schemas_dir)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -64,7 +68,6 @@ fn raw_schema_jsons(schemas_dir: &Path) -> io::Result<HashMap<String, Map<String
                                             .to_string(),
                                         schema_json);
             };
-
         }
     }
     Ok(raw_schema_jsons)
@@ -191,7 +194,7 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
 ///
 ///  # Example:
 /// Consider the following Avro schemas
-/// ```json
+/// ```text
 /// { "name": "Top",
 ///   "type": "array",
 ///   "items": "Middle"
@@ -211,7 +214,7 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
 /// ```
 /// This function returns the following two HashMaps
 ///
-/// ```json
+/// ```text
 /// // Descendants
 /// {
 ///     "Top": {"Middle"},
@@ -227,12 +230,12 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
 /// }
 /// ```
 #[allow(unused_must_use)]
-fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [HashMap<String, HashSet<String>>; 2] {
+fn build_dependency_tree(raw_schemas: &SchemaMap) -> [SchemaGraph; 2] {
 
     // Value is all types who need the key as part of their definition
-    let mut ancestors: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut ancestors: SchemaGraph = HashMap::new();
     // Value is all of the types needed for definition of key
-    let mut descendants: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut descendants: SchemaGraph = HashMap::new();
 
     for (name, schema_) in raw_schemas.iter() {
         descendants.insert(name.to_owned(), determine_dependencies(schema_));
@@ -256,6 +259,102 @@ fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [
     [ancestors, descendants]
 }
 
+/// Computes a directed subgraph of the dependency tree that is
+///  a) acyclic as a directed graph
+///  b) a spanning forest of the graph when viewed as undirected
+///
+/// It satisfies the property that each tree in the forest has a source from which all other nodes
+///  in said tree are reachable.
+///
+/// This prevents types from being defined more than once upstream.
+#[allow(unused_must_use)]
+fn spanning_tree(ancestors: &mut SchemaGraph, descendants: &mut SchemaGraph) -> Result<(), ResolutionErrorCause> {
+    // Remove self-loops
+    ancestors
+        .iter_mut()
+        .map(|(t, ancs)| ancs.remove(t))
+        .collect::<Vec<bool>>();
+    descendants
+        .iter_mut()
+        .map(|(t, decs)| decs.remove(t))
+        .collect::<Vec<bool>>();
+
+    let sources: HashSet<&String> = ancestors
+        .iter()
+        .filter_map(|(name, ancs)| if ancs.len() == 0 { Some(name) } else {None} )
+        .collect();
+    if sources.len() == 0 {
+        return Err(ResolutionErrorCause::Cyclic);
+    }
+    // Retrieve the edges of the tree resulting from bread-first search
+    let _edges = bfs(&sources, descendants);
+    let edges_to_keep: HashSet<(&String, &String)> = _edges
+        .iter()
+        .map(|(head, tail)| (head, tail))
+        .collect();
+
+    // Remove edges not in the above set
+    ancestors
+        .iter_mut()
+        .map(|(head, ancs)|
+            ancs.retain(|tail| edges_to_keep.contains(&(tail, head))))
+        .collect::<()>();
+
+    descendants
+        .iter_mut()
+        .map(|(tail, decs)|
+            decs.retain(|head| edges_to_keep.contains(&(tail, head))))
+        .collect::<()>();
+    Ok(())
+
+}
+
+/// Performs directed breadth-first search from each source of the graph and returns edges visited.
+fn bfs(sources: &HashSet<&String>, descendants: &SchemaGraph) -> HashSet<(String, String)> {
+    let mut queue: VecDeque<&String> = VecDeque::new();
+    let mut visited: HashSet<&String> = HashSet::new();
+    let mut edges: HashSet<(String, String)> = HashSet::new();
+
+    for source in sources {
+        queue.push_back(source);
+        visited.insert(source);
+
+        while let Some(node) = queue.pop_front() {
+            for descendant in descendants.get(node).expect("Unexpected missing dependency!"){
+                if !visited.contains(descendant) {
+                    visited.insert(descendant);
+                    edges.insert((node.to_owned(), descendant.to_owned()));
+                    queue.push_back(descendant);
+                }
+            }
+        }
+    }
+    edges
+}
+
+/// Traverses a directed graph to find a cycle, if one is found a node in the cycle is returned.
+fn detect_cycle(descendants: &SchemaGraph) -> Option<String> {
+    let mut stack: VecDeque<&String> = VecDeque::new();
+
+    for start in descendants.keys() {
+        stack.push_front(start);
+        let mut visited: HashSet<&String> = HashSet::new();
+        visited.insert(start);
+        while let Some(node) = stack.pop_front() {
+            for descendant in descendants.get(node).unwrap() {
+                if !visited.contains(descendant) {
+                    visited.insert(descendant);
+                    stack.push_front(descendant);
+                }
+                else {
+                    return Some(node.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Given a target Avro schema, looks ups each dependency by name and replaces its name in the
 /// schema with the avro json defintion.
 ///
@@ -266,14 +365,14 @@ fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [
 ///
 ///# Example
 /// Consider the following Avro schemas
-/// ```json
+/// ```text
 /// // Cotained in some_directory/top.avsc
 /// { "name": "Top",
 ///   "type": "array",
 ///   "items": "Middle"
 /// }
 ///```
-/// ```json
+/// ```text
 /// // Contained in some_directory/middle.avsc
 /// { "name": "Bottom",
 ///   "type": "map",
@@ -300,7 +399,7 @@ fn build_dependency_tree(raw_schemas: &HashMap<String, Map<String, Value>>) -> [
 /// }
 ///```
 fn compose(target_type: &String,
-           raw_schemas: &mut HashMap<String, Map<String, Value>>,
+           raw_schemas: &mut SchemaMap,
            dependencies: &HashSet<String> ) -> Result<(), DependencyResolutionError>{
     // Copy the schema definitions necessary
     let mut deps : HashMap<&String, Map<String, Value>> = HashMap::new();
@@ -363,8 +462,7 @@ fn compose(target_type: &String,
 /// and the name of the missing type
 ///
 /// However, if every type is resolved, the resulting json schemas will be returned as a HashMap.
-pub fn resolve_cross_dependencies(schemas_dir: &Path)
-    -> Result<HashMap<String, Map<String, Value>>, DependencyResolutionError> {
+pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<(SchemaMap, SchemaGraph), DependencyResolutionError> {
     let mut raw_schema_jsons = raw_schema_jsons(schemas_dir)
         .expect("Failed to read schemas from given directory");
 
@@ -426,11 +524,14 @@ pub fn resolve_cross_dependencies(schemas_dir: &Path)
                     type_name.as_str()))
             },
             ResolutionErrorCause::Cyclic => {
-                Err(DependencyResolutionError::cyclic_dependency(first))
+                Err(DependencyResolutionError::cyclic_dependency(first.to_string()))
             }
         }
     } else {
-        Ok(raw_schema_jsons)
+        let mut ancestors = ancestors;
+        let mut descendants = descendants;
+        spanning_tree(&mut ancestors, &mut descendants).expect("Unexpected cyclic dependency found!");
+        Ok((raw_schema_jsons, descendants))
     }
 }
 
@@ -441,8 +542,7 @@ pub fn resolve_cross_dependencies(schemas_dir: &Path)
 /// along with the name of the missing type. Otherwise, the reason given is the presence of a cycle
 /// of dependencies. It is the job of the calling function to determine a type in this cycle and
 /// communicate its name in the error message.
-fn resolution_failure_reason(raw_schema_jsons: &HashMap<String, Map<String, Value>>,
-                             graph: [&HashMap<String, HashSet<String>>; 2]) -> ResolutionErrorCause {
+fn resolution_failure_reason(raw_schema_jsons: &SchemaMap, graph: [&SchemaGraph; 2]) -> ResolutionErrorCause {
     let defined_types: HashSet<&String> = raw_schema_jsons.keys().collect();
 
     for direction in &graph {
@@ -465,7 +565,8 @@ mod compose_tests {
     fn setup(path: &Path) -> Result<(), Box<dyn Error>> {
         std::fs::create_dir(path)?;
         let mut file_uuid = File::create(path.join("UUID.avsc"))?;
-        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record",
+        "fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
         let mut file_thing = File::create(path.join("Thing.avsc"))?;
         file_thing.write_all(br#"{
 	"name": "Thing",
@@ -501,7 +602,8 @@ mod compose_tests {
         	]
         }
         "#).expect("Test failed."){
-            assert_eq!(raw_schema_jsons.get("\"UUID\"").expect("Test failed."), &expected_uuid);
+            assert_eq!(raw_schema_jsons.get("\"UUID\"").expect("Test failed."),
+                       &expected_uuid);
         } else {
             panic!("Test failed.");
         }
@@ -516,7 +618,8 @@ mod compose_tests {
         	]
         }
         "#).expect("Test failed."){
-            assert_eq!(raw_schema_jsons.get("\"Thing\"").expect("Test failed."), &expected_thing);
+            assert_eq!(raw_schema_jsons.get("\"Thing\"").expect("Test failed."),
+                       &expected_thing);
         } else {
             panic!("Test failed.");
         }
@@ -531,7 +634,8 @@ mod compose_tests {
         	]
         }
         "#).expect("Test failed."){
-            assert_eq!(raw_schema_jsons.get("\"Other\"").expect("Test failed."), &expected_other);
+            assert_eq!(raw_schema_jsons.get("\"Other\"").expect("Test failed."),
+                       &expected_other);
         } else {
             panic!("Test failed.");
         }
@@ -642,22 +746,18 @@ mod compose_tests {
         let raw_schema_jsons = raw_schema_jsons(Path::new("test_dependency_graph"))
             .expect("Failed to read json schemas from directory.");
         let [ancestors, descendants] = build_dependency_tree(&raw_schema_jsons);
-        let expected_ancestors: HashMap<String, HashSet<String>> = [("\"UUID\"".to_string(),
-                                                                     ["\"Thing\"".to_string(),
-                                                                         "\"Other\"".to_string()]
-                                                                         .iter().cloned().collect()),
+        let expected_ancestors: SchemaGraph =
+            [("\"UUID\"".to_string(), ["\"Thing\"".to_string(), "\"Other\"".to_string()]
+                .iter().cloned().collect()),
             ("\"Thing\"".to_string(), HashSet::new()), ("\"Other\"".to_string(), HashSet::new())]
-            .iter()
-            .cloned()
-            .collect();
+            .iter().cloned().collect();
         assert_eq!(ancestors, expected_ancestors);
 
-        let expected_descendants: HashMap<String, HashSet<String>> = [("\"UUID\"".to_string(), HashSet::new()),
+        let expected_descendants: HashMap<String, HashSet<String>> =
+            [("\"UUID\"".to_string(), HashSet::new()),
             ("\"Thing\"".to_string(), ["\"UUID\"".to_string()].iter().cloned().collect()),
             ("\"Other\"".to_string(), ["\"UUID\"".to_string()].iter().cloned().collect())]
-            .iter()
-            .cloned()
-            .collect();
+            .iter().cloned().collect();
         assert_eq!(descendants, expected_descendants);
         teardown(Path::new("test_dependency_graph"))
     }
@@ -815,7 +915,7 @@ mod compose_tests {
     #[test]
     fn test_resolve_cross_dependencies() -> Result<(), Box<dyn Error>> {
         setup(Path::new("test_resolve_cross_dependencies"))?;
-        let raw_schema_jsons = resolve_cross_dependencies(Path::new("test_resolve_cross_dependencies"))?;
+        let (raw_schema_jsons, _) = resolve_cross_dependencies(Path::new("test_resolve_cross_dependencies"))?;
         if let Value::Object(thing_expected) = serde_json::from_str(r#"
             {
               "name": "Thing",
@@ -911,8 +1011,10 @@ mod compose_tests {
         let raw_schema_jsons = raw_schema_jsons(Path::new("test_missing_dependency_reason"))
             .expect("Test failed");
         let graph = build_dependency_tree(&raw_schema_jsons);
+
         assert_eq!(resolution_failure_reason(&raw_schema_jsons, [&graph[0], &graph[1]]),
                    ResolutionErrorCause::Missing("\"Unknown\"".to_string()));
+
         teardown(Path::new("test_missing_dependency_reason"))
     }
 
@@ -921,7 +1023,8 @@ mod compose_tests {
         let path = Path::new("test_cyclic_dependency");
         std::fs::create_dir(path)?;
         let mut file_uuid = File::create(path.join("UUID.avsc"))?;
-        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record",
+        "fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
         let mut file_thing = File::create(path.join("Thing.avsc"))?;
         file_thing.write_all(br#"{
 	"name": "Thing",
@@ -946,7 +1049,8 @@ mod compose_tests {
         let path = Path::new("test_cyclic_dependency_reason");
         std::fs::create_dir(path)?;
         let mut file_uuid = File::create(path.join("UUID.avsc"))?;
-        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record",
+        "fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
         let mut file_thing = File::create(path.join("Thing.avsc"))?;
         file_thing.write_all(br#"{
 	"name": "Thing",
@@ -965,5 +1069,115 @@ mod compose_tests {
         assert_eq!(resolution_failure_reason(&raw_json_schemas, [&graph[0], &graph[1]]),
         ResolutionErrorCause::Cyclic);
         teardown(path)
+    }
+
+    #[test]
+    fn test_remove_self_loops() {
+        let mut ancestors: SchemaGraph =
+            [("Thing".to_string(), ["Thing".to_string(), "Other".to_string()]
+                .iter().cloned().collect()),
+              ("Other".to_string(), HashSet::new())]
+            .iter().cloned().collect();
+
+        let mut descendants: SchemaGraph = [("Thing".to_string(), HashSet::new()),
+                                            ("Other".to_string(), ["Thing".to_string()]
+                                                .iter().cloned().collect())]
+            .iter().cloned().collect();
+
+        let expected: HashMap<String, HashSet<String>> =
+            [("Thing".to_string(),["Other".to_string()]
+                .iter().cloned().collect()),
+             ("Other".to_string(), HashSet::new())]
+            .iter().cloned().collect();
+        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
+        assert_eq!(expected, ancestors);
+    }
+
+    #[test]
+    #[allow(unused_must_use)]
+    fn test_remove_two_cycle() {
+        let mut ancestors: SchemaGraph =
+            [("Thing".to_string(),[ "Other".to_string()]
+                .iter().cloned().collect()),
+             ("Other".to_string(), [ "Thing".to_string()]
+                 .iter().cloned().collect())]
+            .iter().cloned().collect();
+
+        let mut descendants: SchemaGraph = ancestors.clone();
+        spanning_tree(&mut ancestors, &mut descendants).expect_err("Test failed");
+
+    }
+    #[allow(unused_must_use)]
+    fn make_edges(ancestors: &SchemaGraph) -> HashSet<(String, String)> {
+        let mut edges: HashSet<(String, String)> = HashSet::new();
+        for (tail, heads) in ancestors.iter() {
+            heads.iter()
+                .map(|head| edges.insert((head.to_owned(), tail.to_owned())))
+                .collect::<Vec<bool>>();
+        }
+        edges
+    }
+
+    #[test]
+    fn test_spanning_tree() {
+        let mut descendants: SchemaGraph =
+            [("A".to_string(),[ "B".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+                ("B".to_string(), [ "D".to_string()]
+                    .iter().cloned().collect()),
+                ("C".to_string(), [ "D".to_string()]
+                    .iter().cloned().collect()),
+                ("D".to_string(), HashSet::new())]
+                .iter().cloned().collect();
+
+        let mut ancestors: SchemaGraph =
+            [("D".to_string(),[ "B".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+                ("B".to_string(), [ "A".to_string()]
+                    .iter().cloned().collect()),
+                ("C".to_string(), [ "A".to_string()]
+                    .iter().cloned().collect()),
+                ("A".to_string(), HashSet::new())]
+                .iter().cloned().collect();
+
+        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
+        let possible_trees: Vec<HashSet<(String, String)>> =
+            vec!([("A", "B"), ("A", "C"), ("B", "D")].iter()
+                     .map(|(x,y)| (x.to_string(), y.to_string())).collect(),
+                 [("A", "B"), ("A", "C"), ("C", "D")].iter()
+                     .map(|(x,y)| (x.to_string(), y.to_string())).collect());
+        assert!(possible_trees.contains(&make_edges(&ancestors)))
+
+    }
+
+    #[test]
+    fn test_good_dependency_order() {
+        let mut descendants: SchemaGraph =
+            [("A".to_string(),[ "C".to_string(), "D".to_string()]
+                .iter().cloned().collect()),
+                ("B".to_string(), [ "D".to_string(), "E".to_string()]
+                    .iter().cloned().collect()),
+                ("C".to_string(), HashSet::new()),
+                ("D".to_string(), HashSet::new()),
+                ("E".to_string(), HashSet::new())]
+                .iter().cloned().collect();
+
+        let mut ancestors: SchemaGraph =
+            [("D".to_string(),[ "A".to_string(), "B".to_string()]
+                .iter().cloned().collect()),
+                ("E".to_string(), [ "B".to_string()]
+                    .iter().cloned().collect()),
+                ("C".to_string(), [ "A".to_string()]
+                    .iter().cloned().collect()),
+                ("A".to_string(), HashSet::new()),
+                ("B".to_string(), HashSet::new())]
+                .iter().cloned().collect();
+        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
+        let possible_trees: Vec<HashSet<(String, String)>> =
+            vec!([("A", "C"), ("A", "D"), ("B", "E")].iter()
+                     .map(|(x,y)| (x.to_string(), y.to_string())).collect(),
+                 [("A", "C"), ("B", "D"), ("B", "E")].iter()
+                     .map(|(x,y)| (x.to_string(), y.to_string())).collect());
+        assert!(possible_trees.contains(&make_edges(&ancestors)))
     }
 }

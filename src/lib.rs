@@ -98,15 +98,17 @@ pub mod error;
 mod compose;
 mod templates;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
+use serde_json::Value;
 
 use avro_rs::{schema::RecordField, Schema};
 
 use crate::error::{Error, Result};
 use crate::templates::*;
+use crate::compose::resolve_cross_dependencies;
 
 /// Represents a schema input source.
 pub enum Source<'a> {
@@ -162,6 +164,13 @@ impl Generator {
             }
 
             Source::DirPath(schemas_dir) => {
+                let (mut raw_schemas, schema_graph) = resolve_cross_dependencies(schemas_dir)?;
+                for (name, entry) in raw_schemas.drain() {
+                    let schema = Schema::parse(&Value::Object(entry))?;
+                    self.gen_in_order_with_cross_deps(&schema,
+                                                      Some(&schema_graph.get(&name).unwrap()),
+                                                      output)?
+                }/*
                 for entry in std::fs::read_dir(schemas_dir)? {
                     let path = entry?.path();
                     if !path.is_dir() {
@@ -170,7 +179,7 @@ impl Generator {
                         let schema = Schema::parse_str(&raw_schema)?;
                         self.gen_in_order(&schema, output)?
                     }
-                }
+                }*/
             }
         }
 
@@ -183,8 +192,12 @@ impl Generator {
     /// * Keeps tracks of nested schema->name with `GenState` mapping
     /// * Appends generated Rust types to the output
     fn gen_in_order(&self, schema: &Schema, output: &mut impl Write) -> Result<()> {
+        self.gen_in_order_with_cross_deps(schema,None, output)
+    }
+    fn gen_in_order_with_cross_deps(&self, schema: &Schema, allowed_deps: Option<&HashSet<String>>, output: &mut impl Write) -> Result<()> {
         let mut gs = GenState::new();
         let mut deps = deps_stack(schema);
+
 
         while let Some(s) = deps.pop() {
             match s {
@@ -200,7 +213,7 @@ impl Generator {
 
                 // Generate code with potentially nested types
                 Schema::Record { .. } => {
-                    let code = &self.templater.str_record(&s, &gs)?;
+                    let code = &self.templater.str_record(&s, allowed_deps, &gs)?;
                     output.write_all(code.as_bytes())?
                 }
 
@@ -379,6 +392,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::compose::resolve_cross_dependencies;
 
     macro_rules! assert_schema_gen (
         ($generator:expr, $expected:expr, $raw_schema:expr) => (
@@ -731,5 +745,55 @@ impl Default for Snmp {
 
         let s = deps.pop();
         assert_matches!(s, None);
+    }
+
+    #[test]
+    fn test_parse_dir_with_cross_dependencies() -> Result<()> {
+        let path = Path::new("test_parse_dir");
+        std::fs::create_dir(path)?;
+        let mut file_uuid = File::create(path.join("UUID.avsc"))?;
+        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_thing = File::create(path.join("Thing.avsc"))?;
+        file_thing.write_all(br#"{
+	"name": "Thing",
+	"type": "record",
+	"fields": [{"name": "id", "type": "UUID"},{"name": "other", "type": "float"}]}"#)?;
+        let mut file_other = File::create(path.join("Other.avsc"))?;
+        file_other.write_all(br#"{
+	"name": "Other",
+	"type": "record",
+	"fields": [
+		{"name": "id", "type": "UUID"},
+		{"name": "other", "type": "UUID"}]}"#)?;
+
+        let mut file_complex = File::create(path.join("Complex.avsc"))?;
+        file_complex.write_all(br#"{
+	"name": "Complex",
+	"type": "record",
+	"fields": [
+		{"name": "other", "type": "Other"},
+		{"name": "thing", "type": "Thing"}]}"#)?;
+
+        let generator = Generator::new().unwrap();
+        let mut results: Vec<String> = Vec::new();
+
+        let (mut raw_schemas, schema_graph) = resolve_cross_dependencies(path)?;
+        println!("{:?}", schema_graph);
+        for (name, entry) in raw_schemas.drain() {
+            let schema = Schema::parse(&Value::Object(entry))?;
+            let mut buf = vec![];
+            generator.gen_in_order_with_cross_deps(&schema,
+                                              Some(&schema_graph.get(&name).unwrap()),
+                                              &mut buf)?;
+            results.push(String::from_utf8(buf).unwrap());
+        }
+
+        for r in results{
+            println!("{}", r);
+            println!("\n\n\n\n");
+        }
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+
     }
 }
