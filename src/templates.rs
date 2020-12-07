@@ -90,23 +90,6 @@ pub const FIXED_TEMPLATE: &str = "
 pub type {{ name }} = [u8; {{ size }}];
 ";
 
-/// The Avro primitive types from which more complex types are built
-fn is_primitive(type_name: &String) -> bool {
-    match type_name.as_str() {
-        "null"
-        | "boolean"
-        | "int"
-        | "long"
-        | "bytes"
-        | "string"
-        | "float"
-        | "double"
-        | "enum"
-        | "fixed"=> true,
-        _ => false
-    }
-}
-
 lazy_static! {
     static ref RESERVED: HashSet<String> = {
         let s: HashSet<_> = vec![
@@ -243,7 +226,7 @@ impl Templater {
 
     /// Generates a Rust struct based on a Schema::Record schema.
     /// Makes use of a `GenState` for nested schemas (i.e. Array/Map/Union).
-    pub fn str_record(&self, schema: &Schema, allowed_deps: Option<&HashSet<String>>, gen_state: &GenState) -> Result<String> {
+    pub fn str_record(&self, schema: &Schema, gen_state: &GenState) -> Result<String> {
         if let Schema::Record {
             name: Name { name, .. },
             fields,
@@ -273,12 +256,7 @@ impl Templater {
                 ..
             }) = by_pos.get(&i)
             {
-                if allowed_deps.and_then(
-                    |deps| Some(!is_primitive(&name) && !deps.contains(name)))
-                    .unwrap_or(false) {
-                    i += 1;
-                    continue;
-                }
+
                 let name_std = sanitize(name.to_snake_case());
                 o.insert(name_std.clone(), name);
 
@@ -882,7 +860,7 @@ impl Default for User {
         let templater = Templater::new().unwrap();
         let schema = Schema::parse_str(&raw_schema).unwrap();
         let gs = GenState::new();
-        let res = templater.str_record(&schema, None, &gs).unwrap();
+        let res = templater.str_record(&schema, &gs).unwrap();
 
         assert_eq!(expected, res);
     }
@@ -921,7 +899,7 @@ impl Default for User {
         let templater = Templater::new().unwrap();
         let schema = Schema::parse_str(&raw_schema).unwrap();
         let gs = GenState::new();
-        let res = templater.str_record(&schema, None, &gs).unwrap();
+        let res = templater.str_record(&schema, &gs).unwrap();
 
         assert_eq!(expected, res);
     }
@@ -966,7 +944,7 @@ impl Default for User {
         let templater = Templater::new().unwrap();
         let schema = Schema::parse_str(&raw_schema).unwrap();
         let gs = GenState::new();
-        let res = templater.str_record(&schema, None, &gs).unwrap();
+        let res = templater.str_record(&schema, &gs).unwrap();
 
         assert_eq!(expected, res);
     }

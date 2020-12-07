@@ -98,7 +98,7 @@ pub mod error;
 mod compose;
 mod templates;
 
-use std::collections::{HashMap, VecDeque, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
@@ -108,7 +108,7 @@ use avro_rs::{schema::RecordField, Schema};
 
 use crate::error::{Error, Result};
 use crate::templates::*;
-use crate::compose::resolve_cross_dependencies;
+use crate::compose::{resolve_cross_dependencies, Dependencies};
 
 /// Represents a schema input source.
 pub enum Source<'a> {
@@ -164,22 +164,13 @@ impl Generator {
             }
 
             Source::DirPath(schemas_dir) => {
-                let (mut raw_schemas, schema_graph) = resolve_cross_dependencies(schemas_dir)?;
+                let (mut raw_schemas, deps_to_write) = resolve_cross_dependencies(schemas_dir)?;
                 for (name, entry) in raw_schemas.drain() {
                     let schema = Schema::parse(&Value::Object(entry))?;
                     self.gen_in_order_with_cross_deps(&schema,
-                                                      Some(&schema_graph.get(&name).unwrap()),
+                                                      Some(deps_to_write.get(&name).unwrap()),
                                                       output)?
-                }/*
-                for entry in std::fs::read_dir(schemas_dir)? {
-                    let path = entry?.path();
-                    if !path.is_dir() {
-                        let mut raw_schema = String::new();
-                        File::open(&path)?.read_to_string(&mut raw_schema)?;
-                        let schema = Schema::parse_str(&raw_schema)?;
-                        self.gen_in_order(&schema, output)?
-                    }
-                }*/
+                }
             }
         }
 
@@ -194,10 +185,10 @@ impl Generator {
     fn gen_in_order(&self, schema: &Schema, output: &mut impl Write) -> Result<()> {
         self.gen_in_order_with_cross_deps(schema,None, output)
     }
-    fn gen_in_order_with_cross_deps(&self, schema: &Schema, allowed_deps: Option<&HashSet<String>>, output: &mut impl Write) -> Result<()> {
+    fn gen_in_order_with_cross_deps(&self, schema: &Schema, deps_to_write: Option<Dependencies>, output: &mut impl Write) -> Result<()> {
         let mut gs = GenState::new();
         let mut deps = deps_stack(schema);
-
+        let deps_to_write = deps_to_write.unwrap_or_default();
 
         while let Some(s) = deps.pop() {
             match s {
@@ -212,8 +203,11 @@ impl Generator {
                 }
 
                 // Generate code with potentially nested types
-                Schema::Record { .. } => {
-                    let code = &self.templater.str_record(&s, allowed_deps, &gs)?;
+                Schema::Record { name: type_name, .. } => {
+                    if !deps_to_write.contains(&type_name.name) {
+                        continue;
+                    }
+                    let code = &self.templater.str_record(&s, &gs)?;
                     output.write_all(code.as_bytes())?
                 }
 
@@ -223,6 +217,7 @@ impl Generator {
                     gs.put_type(&s, type_str)
                 }
                 Schema::Map(inner) => {
+
                     let type_str = map_type(inner, &gs)?;
                     gs.put_type(&s, type_str)
                 }
@@ -349,6 +344,7 @@ fn deps_stack(schema: &Schema) -> Vec<&Schema> {
     deps
 }
 
+
 /// A builder class to customize `Generator`.
 pub struct GeneratorBuilder {
     precision: usize,
@@ -392,7 +388,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::compose::resolve_cross_dependencies;
+    use crate::compose::{DependenciesMap};
+    use std::collections::HashSet;
 
     macro_rules! assert_schema_gen (
         ($generator:expr, $expected:expr, $raw_schema:expr) => (
@@ -747,43 +744,60 @@ impl Default for Snmp {
         assert_matches!(s, None);
     }
 
-    #[test]
-    fn test_parse_dir_with_cross_dependencies() -> Result<()> {
-        let path = Path::new("test_parse_dir");
+    fn setup_basic_dir(path: &Path) -> Result<()> {
+
         std::fs::create_dir(path)?;
         let mut file_uuid = File::create(path.join("UUID.avsc"))?;
-        file_uuid.write_all(br#"{"name": "UUID","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        file_uuid.write_all(br#"{"name": "A","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
         let mut file_thing = File::create(path.join("Thing.avsc"))?;
         file_thing.write_all(br#"{
-	"name": "Thing",
-	"type": "record",
-	"fields": [{"name": "id", "type": "UUID"},{"name": "other", "type": "float"}]}"#)?;
+	"name": "B",
+	"type": "array",
+	"items": "A"}"#)?;
         let mut file_other = File::create(path.join("Other.avsc"))?;
         file_other.write_all(br#"{
-	"name": "Other",
+	"name": "D",
 	"type": "record",
 	"fields": [
-		{"name": "id", "type": "UUID"},
-		{"name": "other", "type": "UUID"}]}"#)?;
+		{"name": "id", "type": "B"},
+		{"name": "other", "type": "A"}]}"#)?;
 
         let mut file_complex = File::create(path.join("Complex.avsc"))?;
         file_complex.write_all(br#"{
-	"name": "Complex",
+	"name": "C",
 	"type": "record",
 	"fields": [
-		{"name": "other", "type": "Other"},
-		{"name": "thing", "type": "Thing"}]}"#)?;
+		{"name": "other", "type": "A"},
+		{"name": "thing", "type": "B"}]}"#)?;
+        Ok(())
+    }
 
+    fn teardown_basic_dir(path: &Path) -> Result<()> {
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_parse_dir_with_cross_dependencies() -> Result<()> {
+        let path = Path::new("test_parse_dir");
+        setup_basic_dir(&path)?;
         let generator = Generator::new().unwrap();
         let mut results: Vec<String> = Vec::new();
 
-        let (mut raw_schemas, schema_graph) = resolve_cross_dependencies(path)?;
-        println!("{:?}", schema_graph);
+        let (mut raw_schemas, _) = resolve_cross_dependencies(path)?;
+
+        let deps_to_write= DependenciesMap::new(
+            [("\"C\"".to_string(), ["A".to_string(), "B".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+                  ("\"D\"".to_string(), ["D".to_string()].iter().cloned().collect())]
+            .iter().cloned().collect());
+
         for (name, entry) in raw_schemas.drain() {
             let schema = Schema::parse(&Value::Object(entry))?;
             let mut buf = vec![];
             generator.gen_in_order_with_cross_deps(&schema,
-                                              Some(&schema_graph.get(&name).unwrap()),
+                                              Some(deps_to_write.get(&name).unwrap()),
                                               &mut buf)?;
             results.push(String::from_utf8(buf).unwrap());
         }
@@ -792,8 +806,8 @@ impl Default for Snmp {
             println!("{}", r);
             println!("\n\n\n\n");
         }
-        std::fs::remove_dir_all(path)?;
-        Ok(())
+
+        teardown_basic_dir(&path)
 
     }
 }

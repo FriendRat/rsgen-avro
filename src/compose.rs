@@ -24,6 +24,69 @@ enum ResolutionErrorCause {
 type SchemaMap = HashMap<String, Map<String, Value>>;
 pub type SchemaGraph = HashMap<String, HashSet<String>>;
 
+/// Wrapper around a nullable HashSet pointer that provides a default value that
+/// always "contains" Avro primitive types
+///
+/// The null case is used when no cross dependencies are present and thus this set should "contain"
+/// all  types. Only if working with cross-dependencies do we place restrictions on those
+/// dependencies of a type which are eligible for code generation (so that they do not get defined
+/// more than once if they are a dependency of multiple types).
+#[derive(Default)]
+pub struct Dependencies<'a> {
+    deps: Option<&'a HashSet<String>>
+}
+
+impl<'a> Dependencies<'a> {
+    fn new(deps: &HashSet<String>) -> Dependencies {
+        Dependencies{deps: Some(deps)}
+    }
+
+    pub fn contains(&self, value: &String) -> bool {
+        match value.as_str() {
+            "null"
+            | "boolean"
+            | "int"
+            | "long"
+            | "bytes"
+            | "string"
+            | "float"
+            | "double"
+            | "enum"
+            | "fixed" => true,
+            _ => {
+                if let Some(inner) = self.deps {
+                    inner.contains(value)
+                } else {
+                    true
+                }
+            }
+        }
+    }
+}
+
+
+/// A wrapper around a HashSet that implements a default dict like interface with a non-standard
+/// default we wish to use (see the Dependencies type).
+#[derive(Default, Debug)]
+pub struct DependenciesMap {
+    deps: Option<SchemaGraph>
+}
+
+impl DependenciesMap {
+    pub fn new(deps: SchemaGraph) -> DependenciesMap {
+        DependenciesMap{deps: Some(deps)}
+    }
+
+    pub fn get(&self, key: &String) -> Option<Dependencies> {
+        if let Some(inner) = &self.deps {
+            inner.get(key).map(|values| Dependencies::new(values))
+        } else {
+            None
+        }
+    }
+}
+
+
 impl DependencyResolutionError {
 
     /// Makes the appropriate error message for when the definition for a dependency is not found
@@ -74,7 +137,7 @@ fn raw_schema_jsons(schemas_dir: &Path) -> io::Result<SchemaMap> {
 }
 
 /// The Avro primitive types from which more complex types are built
-fn is_primitive(ty: &Value) -> bool {
+pub fn is_primitive(ty: &Value) -> bool {
     if let Value::String(type_name) = ty {
         match type_name.as_str() {
             "null"
@@ -266,94 +329,54 @@ fn build_dependency_tree(raw_schemas: &SchemaMap) -> [SchemaGraph; 2] {
 /// It satisfies the property that each tree in the forest has a source from which all other nodes
 ///  in said tree are reachable.
 ///
-/// This prevents types from being defined more than once upstream.
+/// Each type in the graph may have multiple sources as ancestors. This makes a choice of
+/// designated source (among the possible ancestors) for each type. This prevents types from being
+/// defined more than once later on.
 #[allow(unused_must_use)]
-fn spanning_tree(ancestors: &mut SchemaGraph, descendants: &mut SchemaGraph) -> Result<(), ResolutionErrorCause> {
-    // Remove self-loops
-    ancestors
-        .iter_mut()
-        .map(|(t, ancs)| ancs.remove(t))
-        .collect::<Vec<bool>>();
-    descendants
-        .iter_mut()
-        .map(|(t, decs)| decs.remove(t))
-        .collect::<Vec<bool>>();
+fn designated_source_per_type(ancestors: &SchemaGraph, descendants: &SchemaGraph)
+    -> Result<SchemaGraph, ResolutionErrorCause> {
 
-    let sources: HashSet<&String> = ancestors
+    let sources: HashSet<String> = ancestors
         .iter()
         .filter_map(|(name, ancs)| if ancs.len() == 0 { Some(name) } else {None} )
+        .cloned()
         .collect();
+
     if sources.len() == 0 {
         return Err(ResolutionErrorCause::Cyclic);
     }
-    // Retrieve the edges of the tree resulting from bread-first search
-    let _edges = bfs(&sources, descendants);
-    let edges_to_keep: HashSet<(&String, &String)> = _edges
-        .iter()
-        .map(|(head, tail)| (head, tail))
-        .collect();
-
-    // Remove edges not in the above set
-    ancestors
-        .iter_mut()
-        .map(|(head, ancs)|
-            ancs.retain(|tail| edges_to_keep.contains(&(tail, head))))
-        .collect::<()>();
-
-    descendants
-        .iter_mut()
-        .map(|(tail, decs)|
-            decs.retain(|head| edges_to_keep.contains(&(tail, head))))
-        .collect::<()>();
-    Ok(())
+    // Creates the subgraph using breadth-first search
+    let source_deps = bfs(&sources, descendants);
+    Ok(source_deps)
 
 }
 
 /// Performs directed breadth-first search from each source of the graph and returns edges visited.
-fn bfs(sources: &HashSet<&String>, descendants: &SchemaGraph) -> HashSet<(String, String)> {
+fn bfs(sources: &HashSet<String>, descendants: &SchemaGraph) -> SchemaGraph {
     let mut queue: VecDeque<&String> = VecDeque::new();
     let mut visited: HashSet<&String> = HashSet::new();
-    let mut edges: HashSet<(String, String)> = HashSet::new();
+    let mut source_deps: SchemaGraph = HashMap::new();
 
     for source in sources {
+        let mut deps = HashSet::new();
+
         queue.push_back(source);
         visited.insert(source);
-
+        deps.insert(source.to_owned());
         while let Some(node) = queue.pop_front() {
             for descendant in descendants.get(node).expect("Unexpected missing dependency!"){
                 if !visited.contains(descendant) {
                     visited.insert(descendant);
-                    edges.insert((node.to_owned(), descendant.to_owned()));
+                    deps.insert(descendant.to_owned());
                     queue.push_back(descendant);
                 }
             }
         }
+        source_deps.insert(source.to_owned(), deps);
     }
-    edges
+    source_deps
 }
 
-/// Traverses a directed graph to find a cycle, if one is found a node in the cycle is returned.
-fn detect_cycle(descendants: &SchemaGraph) -> Option<String> {
-    let mut stack: VecDeque<&String> = VecDeque::new();
-
-    for start in descendants.keys() {
-        stack.push_front(start);
-        let mut visited: HashSet<&String> = HashSet::new();
-        visited.insert(start);
-        while let Some(node) = stack.pop_front() {
-            for descendant in descendants.get(node).unwrap() {
-                if !visited.contains(descendant) {
-                    visited.insert(descendant);
-                    stack.push_front(descendant);
-                }
-                else {
-                    return Some(node.to_owned());
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Given a target Avro schema, looks ups each dependency by name and replaces its name in the
 /// schema with the avro json defintion.
@@ -462,7 +485,7 @@ fn compose(target_type: &String,
 /// and the name of the missing type
 ///
 /// However, if every type is resolved, the resulting json schemas will be returned as a HashMap.
-pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<(SchemaMap, SchemaGraph), DependencyResolutionError> {
+pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<(SchemaMap, DependenciesMap), DependencyResolutionError> {
     let mut raw_schema_jsons = raw_schema_jsons(schemas_dir)
         .expect("Failed to read schemas from given directory");
 
@@ -528,10 +551,11 @@ pub fn resolve_cross_dependencies(schemas_dir: &Path) -> Result<(SchemaMap, Sche
             }
         }
     } else {
-        let mut ancestors = ancestors;
-        let mut descendants = descendants;
-        spanning_tree(&mut ancestors, &mut descendants).expect("Unexpected cyclic dependency found!");
-        Ok((raw_schema_jsons, descendants))
+        let mut source_deps = designated_source_per_type(&ancestors, &descendants)
+            .expect("Unexpected cyclic dependency found!");
+        scrub_names(&mut source_deps);
+        raw_schema_jsons.retain(|name, _| source_deps.contains_key(name));
+        Ok((raw_schema_jsons, DependenciesMap::new(source_deps)))
     }
 }
 
@@ -554,6 +578,14 @@ fn resolution_failure_reason(raw_schema_jsons: &SchemaMap, graph: [&SchemaGraph;
         }
     }
     ResolutionErrorCause::Cyclic
+}
+
+/// Removes the \" character from the names.
+fn scrub_names(schema_graph: &mut SchemaGraph) {
+    for schema_list in schema_graph.values_mut() {
+        *schema_list = schema_list.iter().map(|name| name.replace("\"", "")).collect();
+    }
+
 }
 
 
@@ -965,18 +997,7 @@ mod compose_tests {
             assert_eq!(&other_expected, raw_schema_jsons.get("\"Other\"").unwrap());
         }
 
-        if let Value::Object(uuid_expected) = serde_json::from_str(r#"
-        {
-            "name": "UUID",
-            "type": "record",
-            "fields": [
-            {"name": "bytes", "type": "bytes"}
-            ]
-        }
-        "#).expect("Test failed") {
-            assert_eq!(&uuid_expected, raw_schema_jsons.get("\"UUID\"").unwrap());
-        }
-        assert_eq!(raw_schema_jsons.len(), 3);
+        assert_eq!(raw_schema_jsons.len(), 2);
         teardown(Path::new("test_resolve_cross_dependencies"))
     }
 
@@ -1072,28 +1093,6 @@ mod compose_tests {
     }
 
     #[test]
-    fn test_remove_self_loops() {
-        let mut ancestors: SchemaGraph =
-            [("Thing".to_string(), ["Thing".to_string(), "Other".to_string()]
-                .iter().cloned().collect()),
-              ("Other".to_string(), HashSet::new())]
-            .iter().cloned().collect();
-
-        let mut descendants: SchemaGraph = [("Thing".to_string(), HashSet::new()),
-                                            ("Other".to_string(), ["Thing".to_string()]
-                                                .iter().cloned().collect())]
-            .iter().cloned().collect();
-
-        let expected: HashMap<String, HashSet<String>> =
-            [("Thing".to_string(),["Other".to_string()]
-                .iter().cloned().collect()),
-             ("Other".to_string(), HashSet::new())]
-            .iter().cloned().collect();
-        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
-        assert_eq!(expected, ancestors);
-    }
-
-    #[test]
     #[allow(unused_must_use)]
     fn test_remove_two_cycle() {
         let mut ancestors: SchemaGraph =
@@ -1104,23 +1103,12 @@ mod compose_tests {
             .iter().cloned().collect();
 
         let mut descendants: SchemaGraph = ancestors.clone();
-        spanning_tree(&mut ancestors, &mut descendants).expect_err("Test failed");
-
-    }
-    #[allow(unused_must_use)]
-    fn make_edges(ancestors: &SchemaGraph) -> HashSet<(String, String)> {
-        let mut edges: HashSet<(String, String)> = HashSet::new();
-        for (tail, heads) in ancestors.iter() {
-            heads.iter()
-                .map(|head| edges.insert((head.to_owned(), tail.to_owned())))
-                .collect::<Vec<bool>>();
-        }
-        edges
+        designated_source_per_type(&mut ancestors, &mut descendants).expect_err("Test failed");
     }
 
     #[test]
-    fn test_spanning_tree() {
-        let mut descendants: SchemaGraph =
+    fn test_designated_source_per_type() {
+        let descendants: SchemaGraph =
             [("A".to_string(),[ "B".to_string(), "C".to_string()]
                 .iter().cloned().collect()),
                 ("B".to_string(), [ "D".to_string()]
@@ -1130,7 +1118,7 @@ mod compose_tests {
                 ("D".to_string(), HashSet::new())]
                 .iter().cloned().collect();
 
-        let mut ancestors: SchemaGraph =
+        let ancestors: SchemaGraph =
             [("D".to_string(),[ "B".to_string(), "C".to_string()]
                 .iter().cloned().collect()),
                 ("B".to_string(), [ "A".to_string()]
@@ -1140,19 +1128,19 @@ mod compose_tests {
                 ("A".to_string(), HashSet::new())]
                 .iter().cloned().collect();
 
-        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
-        let possible_trees: Vec<HashSet<(String, String)>> =
-            vec!([("A", "B"), ("A", "C"), ("B", "D")].iter()
-                     .map(|(x,y)| (x.to_string(), y.to_string())).collect(),
-                 [("A", "B"), ("A", "C"), ("C", "D")].iter()
-                     .map(|(x,y)| (x.to_string(), y.to_string())).collect());
-        assert!(possible_trees.contains(&make_edges(&ancestors)))
+        let source_deps = designated_source_per_type(&ancestors, &descendants)
+            .expect("Test failed");
+        let expected: SchemaGraph = [("A".to_string(),
+                                      ["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()]
+                                          .iter().cloned().collect())]
+            .iter().cloned().collect();
+        assert_eq!(expected, source_deps);
 
     }
 
     #[test]
     fn test_good_dependency_order() {
-        let mut descendants: SchemaGraph =
+        let descendants: SchemaGraph =
             [("A".to_string(),[ "C".to_string(), "D".to_string()]
                 .iter().cloned().collect()),
                 ("B".to_string(), [ "D".to_string(), "E".to_string()]
@@ -1162,7 +1150,7 @@ mod compose_tests {
                 ("E".to_string(), HashSet::new())]
                 .iter().cloned().collect();
 
-        let mut ancestors: SchemaGraph =
+        let ancestors: SchemaGraph =
             [("D".to_string(),[ "A".to_string(), "B".to_string()]
                 .iter().cloned().collect()),
                 ("E".to_string(), [ "B".to_string()]
@@ -1172,12 +1160,20 @@ mod compose_tests {
                 ("A".to_string(), HashSet::new()),
                 ("B".to_string(), HashSet::new())]
                 .iter().cloned().collect();
-        spanning_tree(&mut ancestors, &mut descendants).expect("Test failed");
-        let possible_trees: Vec<HashSet<(String, String)>> =
-            vec!([("A", "C"), ("A", "D"), ("B", "E")].iter()
-                     .map(|(x,y)| (x.to_string(), y.to_string())).collect(),
-                 [("A", "C"), ("B", "D"), ("B", "E")].iter()
-                     .map(|(x,y)| (x.to_string(), y.to_string())).collect());
-        assert!(possible_trees.contains(&make_edges(&ancestors)))
+        let source_deps = designated_source_per_type(&ancestors, &descendants)
+            .expect("Test failed");
+        let expected_1: SchemaGraph =
+            [("A".to_string(), ["A".to_string(), "C".to_string(), "D".to_string()]
+                .iter().cloned().collect()),
+             ("B".to_string(), ["B".to_string(), "E".to_string()]
+                 .iter().cloned().collect())]
+             .iter().cloned().collect();
+        let expected_2: SchemaGraph =
+            [("A".to_string(), ["A".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+            ("B".to_string(), ["B".to_string(), "D".to_string(), "E".to_string()]
+                .iter().cloned().collect())]
+            .iter().cloned().collect();
+        assert!(source_deps == expected_1 || source_deps == expected_2)
     }
 }
