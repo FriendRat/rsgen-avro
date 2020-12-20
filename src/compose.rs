@@ -229,8 +229,16 @@ fn determine_dependencies(raw_schema: &Map<String, Value>) -> HashSet<String> {
                 for field in inner {
                     let ty = &field.get("type")
                         .expect("Failed to fetch \"type\" from a field of an Avro record schema.");
-                    if !is_primitive(ty) {
-                        dependencies.insert(ty.to_string());
+                    if let Value::Array(inner_types) = ty {
+                        for inner_ty in inner_types {
+                            if !is_primitive(inner_ty) {
+                                dependencies.insert(inner_ty.to_string());
+                            }
+                        }
+                    } else {
+                        if !is_primitive(ty) {
+                            dependencies.insert(ty.to_string());
+                        }
                     }
                 }
             }
@@ -454,12 +462,26 @@ fn compose(target_type: &String,
         "record" => {
             if let Value::Array(inner) = target_schema.get("fields").unwrap().to_owned() {
                 for (ix, field) in inner.iter().enumerate() {
-                    let dep_name = field.get("type")
-                        .unwrap()
-                        .to_string();
-                    if dependencies.contains(&dep_name) {
+                    let dep_name = field.get("type").unwrap();
+                    if let Value::Array(inner_types ) = dep_name {
+                        let mut resolved_types: Vec<Value> = Vec::new();
+                        for inner_ty in inner_types {
+                            if dependencies.contains(&inner_ty.to_string()) {
+                                resolved_types.push(Value::Object(deps.get(&inner_ty.to_string())
+                                    .unwrap()
+                                    .to_owned()));
+                            } else if is_primitive(&inner_ty) {
+                                resolved_types.push(inner_ty.clone());
+                            }
+                        }
                         *target_schema.get_mut("fields").unwrap()[ix].get_mut("type").unwrap() =
-                            Value::Object(deps.get(&dep_name).unwrap().to_owned());
+                            Value::Array(resolved_types);
+
+                    } else{
+                        if dependencies.contains(&dep_name.to_string()) {
+                            *target_schema.get_mut("fields").unwrap()[ix].get_mut("type").unwrap() =
+                                Value::Object(deps.get(&dep_name.to_string()).unwrap().to_owned());
+                        }
                     }
                 }
             }

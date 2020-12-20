@@ -744,31 +744,44 @@ impl Default for Snmp {
         assert_matches!(s, None);
     }
 
-    fn setup_basic_dir(path: &Path) -> Result<()> {
+    fn setup_basic_dir_1(path: &Path) -> Result<()> {
 
         std::fs::create_dir(path)?;
-        let mut file_uuid = File::create(path.join("UUID.avsc"))?;
-        file_uuid.write_all(br#"{"name": "A","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
-        let mut file_thing = File::create(path.join("Thing.avsc"))?;
-        file_thing.write_all(br#"{
+        let mut file_a = File::create(path.join("A.avsc"))?;
+        file_a.write_all(br#"{"name": "A","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_b = File::create(path.join("B.avsc"))?;
+        file_b.write_all(br#"{
 	"name": "B",
 	"type": "array",
 	"items": "A"}"#)?;
-        let mut file_other = File::create(path.join("Other.avsc"))?;
-        file_other.write_all(br#"{
+        let mut file_d = File::create(path.join("D.avsc"))?;
+        file_d.write_all(br#"{
 	"name": "D",
 	"type": "record",
 	"fields": [
 		{"name": "id", "type": "B"},
 		{"name": "other", "type": "A"}]}"#)?;
 
-        let mut file_complex = File::create(path.join("Complex.avsc"))?;
-        file_complex.write_all(br#"{
+        let mut file_c = File::create(path.join("C.avsc"))?;
+        file_c.write_all(br#"{
 	"name": "C",
 	"type": "record",
 	"fields": [
 		{"name": "other", "type": "A"},
 		{"name": "thing", "type": "B"}]}"#)?;
+        Ok(())
+    }
+
+    fn setup_basic_dir_nullable(path: &Path) -> Result<()> {
+
+        std::fs::create_dir(path)?;
+        let mut file_a = File::create(path.join("A.avsc"))?;
+        file_a.write_all(br#"{"name": "A","type": "record","fields": [{"name": "bytes", "type": "bytes"}]}"#)?;
+        let mut file_b = File::create(path.join("B.avsc"))?;
+        file_b.write_all(br#"{
+	"name": "B",
+	"type": "record",
+	"fields": [{"name": "alpha", "type": ["null", "A"]}]}"#)?;
         Ok(())
     }
 
@@ -778,36 +791,139 @@ impl Default for Snmp {
     }
 
 
-    #[test]
-    fn test_parse_dir_with_cross_dependencies() -> Result<()> {
-        let path = Path::new("test_parse_dir");
-        setup_basic_dir(&path)?;
-        let generator = Generator::new().unwrap();
-        let mut results: Vec<String> = Vec::new();
+    fn generate_schemas_from_dependencies_map(path: &Path, deps_to_write: &DependenciesMap, source_order: &[String]) -> Result<String> {
 
+        let generator = Generator::new().unwrap();
+        let mut results: String = String::new();
         let (mut raw_schemas, _) = resolve_cross_dependencies(path)?;
 
-        let deps_to_write= DependenciesMap::new(
-            [("\"C\"".to_string(), ["A".to_string(), "B".to_string(), "C".to_string()]
-                .iter().cloned().collect()),
-                  ("\"D\"".to_string(), ["D".to_string()].iter().cloned().collect())]
-            .iter().cloned().collect());
-
-        for (name, entry) in raw_schemas.drain() {
+        for name in source_order {
+            let entry = raw_schemas.remove(name).expect("Test failed");
             let schema = Schema::parse(&Value::Object(entry))?;
             let mut buf = vec![];
             generator.gen_in_order_with_cross_deps(&schema,
-                                              Some(deps_to_write.get(&name).unwrap()),
-                                              &mut buf)?;
-            results.push(String::from_utf8(buf).unwrap());
+                                                   Some(deps_to_write.get(&name).unwrap()),
+                                                   &mut buf)?;
+            results.push_str(&String::from_utf8(buf).unwrap());
         }
 
-        for r in results{
-            println!("{}", r);
-            println!("\n\n\n\n");
-        }
+        Ok(results)
+    }
 
+    #[test]
+    fn test_parse_dir_with_cross_dependencies_1() -> Result<()> {
+        let path = Path::new("test_parse_dir_1");
+        setup_basic_dir_1(&path).expect("Test failed");
+
+        let source_order = ["\"C\"".to_string(), "\"D\"".to_string()];
+        let expected = r#"
+#[serde(default)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct A {
+    pub bytes: Vec<u8>,
+}
+
+impl Default for A {
+    fn default() -> A {
+        A {
+            bytes: vec![],
+        }
+    }
+}
+
+#[serde(default)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct C {
+    pub other: A,
+    pub thing: Vec<A>,
+}
+
+impl Default for C {
+    fn default() -> C {
+        C {
+            other: A::default(),
+            thing: vec![],
+        }
+    }
+}
+
+#[serde(default)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct D {
+    pub id: Vec<A>,
+    pub other: A,
+}
+
+impl Default for D {
+    fn default() -> D {
+        D {
+            id: vec![],
+            other: A::default(),
+        }
+    }
+}
+"#;
+        let deps_to_write= DependenciesMap::new(
+            [("\"C\"".to_string(), ["A".to_string(), "B".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+                ("\"D\"".to_string(), ["D".to_string()].iter().cloned().collect())]
+                .iter().cloned().collect());
+        let generated = generate_schemas_from_dependencies_map(&path, &deps_to_write, &source_order).expect("Test failed");
+        assert_eq!(expected, generated);
+
+        let deps_to_write = DependenciesMap::new(
+            [("\"C\"".to_string(), ["A".to_string(), "C".to_string()]
+                .iter().cloned().collect()),
+                ("\"D\"".to_string(), ["B".to_string(), "D".to_string()]
+                    .iter().cloned().collect())]
+                .iter().cloned().collect());
+        let generated = generate_schemas_from_dependencies_map(&path, &deps_to_write, &source_order).expect("Test failed");
+        assert_eq!(expected, generated);
         teardown_basic_dir(&path)
+    }
 
+
+    #[test]
+    fn test_parse_dir_with_cross_dependencies_nullable() -> Result<()> {
+        let path = Path::new("test_parse_dir_nullable");
+        setup_basic_dir_nullable(&path);
+        let deps_to_write = DependenciesMap::new(
+            [("\"B\"".to_string(), ["B".to_string(), "A".to_string()]
+                .iter().cloned().collect())]
+                .iter().cloned().collect());
+        let source_order = ["\"B\"".to_string()];
+        let generated = generate_schemas_from_dependencies_map(&path, &deps_to_write, &source_order).expect("Test failed");
+        println!("{}", generated);
+        let expected = r#"
+#[serde(default)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct A {
+    pub bytes: Vec<u8>,
+}
+
+impl Default for A {
+    fn default() -> A {
+        A {
+            bytes: vec![],
+        }
+    }
+}
+
+#[serde(default)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct B {
+    pub alpha: Option<A>,
+}
+
+impl Default for B {
+    fn default() -> B {
+        B {
+            alpha: None,
+        }
+    }
+}
+"#;
+        assert_eq!(expected, generated);
+        teardown_basic_dir(&path)
     }
 }
