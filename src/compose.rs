@@ -18,7 +18,7 @@ pub struct DependencyResolutionError {
 #[derive(Eq, PartialEq, Debug)]
 enum ResolutionErrorCause {
     Cyclic,
-    Missing(String)
+    Missing(String),
 }
 
 type SchemaMap = HashMap<String, Map<String, Value>>;
@@ -132,6 +132,9 @@ fn raw_schema_jsons(schemas_dir: &Path) -> io::Result<SchemaMap> {
                                         schema_json);
             };
         }
+    }
+    if raw_schema_jsons.is_empty() {
+        panic!("Could not find any files in this directory containing AVRO schemas");
     }
     Ok(raw_schema_jsons)
 }
@@ -372,7 +375,9 @@ fn bfs(sources: &HashSet<String>, descendants: &SchemaGraph) -> SchemaGraph {
         visited.insert(source);
         deps.insert(source.to_owned());
         while let Some(node) = queue.pop_front() {
-            for descendant in descendants.get(node).expect("Unexpected missing dependency!"){
+            for descendant in descendants.get(node)
+                .expect("Unexpected missing dependencies! \
+                (Note: using namespaces can cause this error)"){
                 if !visited.contains(descendant) {
                     visited.insert(descendant);
                     deps.insert(descendant.to_owned());
