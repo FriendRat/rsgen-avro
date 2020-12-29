@@ -185,6 +185,11 @@ impl Generator {
     fn gen_in_order(&self, schema: &Schema, output: &mut impl Write) -> Result<()> {
         self.gen_in_order_with_cross_deps(schema,None, output)
     }
+
+    /// Performs the  same as gen_in_order except that the input directory had cross dependencies.
+    /// These have been resolved by the time this function is called but an additional data
+    /// structure, "deps_to_write", is given that ensures code generation happens  exactly once for
+    /// each defined type.
     fn gen_in_order_with_cross_deps(&self, schema: &Schema, deps_to_write: Option<Dependencies>, output: &mut impl Write) -> Result<()> {
         let mut gs = GenState::new();
         let mut deps = deps_stack(schema);
@@ -389,7 +394,6 @@ mod tests {
 
     use super::*;
     use crate::compose::{DependenciesMap};
-    use std::collections::HashSet;
 
     macro_rules! assert_schema_gen (
         ($generator:expr, $expected:expr, $raw_schema:expr) => (
@@ -744,7 +748,7 @@ impl Default for Snmp {
         assert_matches!(s, None);
     }
 
-    fn setup_basic_dir_1(path: &Path) -> Result<()> {
+    fn setup_basic_dir(path: &Path) -> Result<()> {
 
         std::fs::create_dir(path)?;
         let mut file_a = File::create(path.join("A.avsc"))?;
@@ -791,7 +795,9 @@ impl Default for Snmp {
     }
 
 
-    fn generate_schemas_from_dependencies_map(path: &Path, deps_to_write: &DependenciesMap, source_order: &[String]) -> Result<String> {
+    fn generate_schemas_from_dependencies_map(path: &Path,
+                                              deps_to_write: &DependenciesMap,
+                                              source_order: &[String]) -> Result<String> {
 
         let generator = Generator::new().unwrap();
         let mut results: String = String::new();
@@ -811,9 +817,9 @@ impl Default for Snmp {
     }
 
     #[test]
-    fn test_parse_dir_with_cross_dependencies_1() -> Result<()> {
+    fn test_parse_dir_with_cross_dependencies() -> Result<()> {
         let path = Path::new("test_parse_dir_1");
-        setup_basic_dir_1(&path).expect("Test failed");
+        setup_basic_dir(&path).expect("Test failed");
 
         let source_order = ["\"C\"".to_string(), "\"D\"".to_string()];
         let expected = r#"
@@ -886,14 +892,13 @@ impl Default for D {
     #[test]
     fn test_parse_dir_with_cross_dependencies_nullable() -> Result<()> {
         let path = Path::new("test_parse_dir_nullable");
-        setup_basic_dir_nullable(&path);
+        setup_basic_dir_nullable(&path)?;
         let deps_to_write = DependenciesMap::new(
             [("\"B\"".to_string(), ["B".to_string(), "A".to_string()]
                 .iter().cloned().collect())]
                 .iter().cloned().collect());
         let source_order = ["\"B\"".to_string()];
         let generated = generate_schemas_from_dependencies_map(&path, &deps_to_write, &source_order).expect("Test failed");
-        println!("{}", generated);
         let expected = r#"
 #[serde(default)]
 #[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]

@@ -720,27 +720,6 @@ mod compose_tests {
         }
     }
 
-    #[test]
-    fn test_union_dependency() {
-        if let Value::Object(record) = serde_json::from_str(&r#"
-        {
-        	"name": "Thing",
-        	"type": "record",
-        	"fields": [
-        		{"name": "id", "type": "UUID"},
-        		{"name": "other", "type": ["null", "float"]}
-        	]
-        }
-        "#).expect("Test failed"){
-            let dependencies = determine_dependencies(&record);
-            let expected : HashSet<String> = ["\"UUID\"".to_string(),
-                "[\"null\",\"float\"]".to_string()].iter().cloned().collect();
-            assert_eq!(expected, dependencies);
-        } else {
-            panic!("Test failed.");
-        }
-    }
-
 
     #[test]
     fn test_array_dependency() {
@@ -776,6 +755,26 @@ mod compose_tests {
             panic!("Test failed.");
         }
     }
+
+    #[test]
+    fn test_union_dependency(){
+        if let Value::Object(union) = serde_json::from_str(&r#"
+        {
+            "name": "Record",
+            "type": "record",
+            "fields": [
+            {"name": "union", "type": ["A", "B"]}
+            ]
+        }
+        "#).expect("Test failed") {
+            let dependencies = determine_dependencies(&union);
+            let expected: HashSet<String> = ["\"A\"".to_string(), "\"B\"".to_string()].iter().cloned().collect();
+            assert_eq!(expected, dependencies);
+        }  else {
+            panic!("Test failed.");
+        }
+    }
+
 
     #[test]
     fn test_no_dependency() {
@@ -934,6 +933,57 @@ mod compose_tests {
             panic!("Test failed");
         }
         teardown(Path::new("test_map_compose"))
+    }
+
+    #[test]
+    fn test_union_compose() -> Result<(), Box<dyn Error>> {
+        setup(Path::new("test_union_compose"))?;
+        let mut raw_schema_jsons = raw_schema_jsons(Path::new("test_union_compose"))
+            .expect("Failed to read json schemas from directory.");
+
+        if let Value::Object(raw_schema) = serde_json::from_str(r#"
+        {
+            "name": "Union",
+            "type": "record",
+            "fields": [
+            {"name": "nullable", "type": ["null", "UUID"]}
+            ]
+        }
+        "#).expect("Test failed") {
+            let dependencies = determine_dependencies(&raw_schema);
+            raw_schema_jsons.insert("\"Union\"".to_string(),raw_schema);
+
+            compose(&"\"Union\"".to_string(), &mut raw_schema_jsons, &dependencies)
+                .expect("Test failed");
+
+            let schema = raw_schema_jsons.get("\"Union\"").expect("Test failed");
+            if let Value::Object(expected) = serde_json::from_str(r#"
+            {
+        	"name": "Union",
+        	"type": "record",
+        	"fields":[
+        	    { "name": "nullable",
+        	      "type": [ "null",
+        	        {"name": "UUID",
+                     "type": "record",
+                     "fields": [
+                      	{"name": "bytes", "type": "bytes"}
+                      ]
+                    }
+                  ]
+                }
+             ]
+            }
+            "#).expect("Test failed") {
+                assert_eq!(schema, &expected);
+            } else {
+                panic!("Test failed")
+            };
+
+        } else {
+            panic!("Test failed");
+        }
+        teardown(Path::new("test_union_compose"))
     }
 
     #[test]
